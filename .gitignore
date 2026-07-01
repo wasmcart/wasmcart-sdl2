@@ -1,0 +1,13 @@
+# compiled objects / static libs (built by build_sdl2_wc.sh — never commit)
+*.o
+*.a
+sdl2_wc/obj/
+sdl2_wc/lib/
+
+# build scratch
+build/
+*.wasm
+*.wasc
+
+node_modules/
+.DS_Store
