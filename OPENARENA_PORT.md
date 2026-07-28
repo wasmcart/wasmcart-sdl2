@@ -491,9 +491,10 @@ for pk3 in /path/to/openarena/baseoa/pak*.pk3; do
 done
 
 # Build .wasc
-node tools/wasmcart-pack.js \
-    examples/openarena/openarena.wasm \
-    /tmp/oa_assets \
+npx wasmcart pack \
+    --wasm "$OUTDIR/openarena.wasm" \
+    --assets /tmp/oa_assets \
+    --name "OpenArena" \
     -o openarena.wasc
 ```
 
@@ -550,8 +551,8 @@ long ZCALLBACK mem_seek(voidpf opaque, voidpf stream, uLong offset, int origin) 
 #!/bin/bash
 # build.sh
 
-IOQDIR=/tmp/ioq3
-OUTDIR=/home/monteslu/code/cliemu/wasmcart/examples/openarena
+IOQDIR="${IOQDIR:-$HOME/src/ioq3}"        # your ioquake3 checkout
+OUTDIR="${OUTDIR:-$PWD/out/openarena}"    # where the built cart lands
 
 # Cross-compile with emscripten
 emcmake cmake -S "$IOQDIR" -B build_wasm \

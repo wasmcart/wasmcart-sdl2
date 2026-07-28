@@ -34,12 +34,13 @@ porting_game_notes.md lessons from porting 16+ games
 ## Build
 
 ```bash
-# builds libSDL2_wc.a (+ libSDL2_ttf_wc.a) against your wasi-sdk / emscripten toolchain
-./sdl2_wc/build_sdl2_wc.sh
+# builds libSDL2_wc.a (+ libSDL2_ttf_wc.a); point EMSDK at your emsdk checkout
+EMSDK=/path/to/emsdk ./sdl2_wc/build_sdl2_wc.sh
 ```
 
 Compiled objects and static libs are **not** committed (see `.gitignore`) — build
-them locally.
+them locally. The build pulls SDL2 from Emscripten's own port cache, so the only
+prerequisite is a working emsdk.
 
 ## The cart contract
 
@@ -47,6 +48,13 @@ The C-side of the wasmcart contract (`wc_cart.h`) and the lightweight cart-autho
 SDK (`wc_fb.h`, `wc_gl.h`, math/mixer helpers) live in the main
 [wasmcart](https://github.com/wasmcart/wasmcart) repo's `include/`. This repo
 depends on that contract; it does not redefine it.
+
+> **Note:** `wc_cart.h` includes `wasmcart.h` (the raw ABI header with the
+> `wc_info_t` / `wc_pad_t` struct definitions), which is not currently published
+> in either repo — it travels with existing ports. Until it ships in the main
+> repo's `include/`, copy it from a port you have, or work from the struct
+> layouts in [SPEC.md](https://github.com/wasmcart/wasmcart/blob/main/SPEC.md),
+> which are normative.
 
 ## Third-party
 

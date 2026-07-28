@@ -9,8 +9,15 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-# Emscripten SDK
-EMSDK_ROOT="$(cd ../../../emsdk && pwd)"
+# Emscripten SDK. Point EMSDK at your emsdk checkout, or have emsdk_env.sh
+# already sourced in your shell (which exports EMSDK for us).
+if [ -z "$EMSDK" ]; then
+    echo "ERROR: set EMSDK to your emsdk checkout, e.g." >&2
+    echo "  EMSDK=/path/to/emsdk $0" >&2
+    echo "(or source /path/to/emsdk/emsdk_env.sh first)" >&2
+    exit 1
+fi
+EMSDK_ROOT="$(cd "$EMSDK" && pwd)"
 source "$EMSDK_ROOT/emsdk_env.sh" 2>/dev/null || true
 
 # SDL2 source (from Emscripten's port cache)

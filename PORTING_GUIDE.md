@@ -27,8 +27,10 @@ to its ring buffer. The host reads pixels and audio after `wc_render()` returns.
 ## Prerequisites
 
 - **Emscripten SDK** (emcc) — install from https://emscripten.org
-- **wasmcart.h** — the ABI header (symlink or copy from `wasmcart/examples/hello/wasmcart.h`)
-- **wasmcart-pack** — for creating `.wasc` archives: `npx wasmcart-pack` or install globally
+- **wasmcart.h** — the ABI header, plus the cart-author SDK (`wc_cart.h`, `wc_fb.h`,
+  `wc_gl.h`, math/mixer helpers) from the main
+  [wasmcart](https://github.com/wasmcart/wasmcart) repo's `include/`
+- **wasmcart** — the CLI, for packing and running carts: `npx wasmcart`
 
 ## Choosing a Format
 
@@ -1193,6 +1195,32 @@ If your game uses a virtual filesystem that needs to list directory contents, pr
 all files at init time by loading `_filelist.txt` (see "File Listing" section above).
 Without pre-registration, only files explicitly requested by exact path will be found.
 
+### Link fails: undefined `wc_sdl_gl_blit` / `gl4es_bridge_set_size` / `wc_gl4es_GetProcAddress`
+
+The video backend references these unconditionally at link time even though it
+only *calls* them behind runtime guards, so they must resolve even for a cart
+that never touches GL.
+
+- `wc_sdl_gl_blit` is provided by `sdl2_wc/sdl2_gl_blit.c` — compile and link
+  that file alongside your cart.
+- The two `gl4es_*` symbols come from gl4es, which only GL1.x ports link. A
+  2D-only cart can satisfy them with no-op stubs:
+
+```c
+/* gl4es_stub.c — a 2D-only cart never reaches these. */
+void  gl4es_bridge_set_size(int w, int h) { (void)w; (void)h; }
+void *wc_gl4es_GetProcAddress(const char *p) { (void)p; return 0; }
+```
+
+### `emcc` can't find `SDL.h`
+
+`-sUSE_SDL=0` is a *link*-time flag. If you pass it while compiling, Emscripten
+substitutes its `fakesdl` headers and every SDL type goes undeclared. Compile
+with `-sUSE_SDL=2` (real headers) and only switch to `-sUSE_SDL=0` on the link
+step, where it stops Emscripten's own SDL2 from competing with `libSDL2_wc.a`.
+Doing both in one `emcc` invocation does not work — split it into a compile
+step and a link step.
+
 ## Shared Libraries
 
 The `porting/include/` directory contains reusable single-header C libraries for
@@ -1699,15 +1727,24 @@ em++ $FLAGS --no-entry \
 
 ### Screenshot Tool for Visual Debugging
 
-Use `wasmcart-screenshot` to capture cart output without needing a display:
+The player captures cart output headlessly, without needing a display:
 
 ```bash
-node bin/wasmcart-screenshot.js game.wasc -o /tmp/screenshot.png --frames 120
+npx wasmcart game.wasc --frames 120 --shot screenshot.png
 ```
 
-This runs the cart headlessly (EGL pbuffer, no window), renders N frames, reads
-pixels via `glReadPixels`, and saves a PNG. Default 120 frames (~2 seconds) lets
-menu animations settle. Requires `native-gles` and ImageMagick `convert`.
+This runs the cart with no window, steps N frames, reads pixels back, and saves a
+PNG. Around 120 frames (~2 seconds) lets menu animations settle. Add `--wav out.wav`
+to dump audio at the same time.
+
+Because the run is deterministic, adding `--seed` makes it a regression test — the
+same seed produces a byte-identical PNG, so a shell loop plus `cmp` catches visual
+regressions:
+
+```bash
+npx wasmcart game.wasc --seed 7 --frames 60 --shot now.png
+cmp golden.png now.png || echo "render changed"
+```
 
 The screenshot tool reads directly from the GL framebuffer — it shows the cart's
 actual rendered output, bypassing any host display pipeline issues.
@@ -2099,7 +2136,30 @@ wasmcart-pack --wasm cart.wasm --assets assets/ -o game.wasc
 Note the build trick: `-sUSE_SDL=2` at compile time (for headers), then
 `-sUSE_SDL=0` at link time (use our `libSDL2_wc.a` instead of Emscripten's).
 
-See `examples/neverball_es/build.sh` for a complete working example.
+A complete, minimal build that is known to work end-to-end (compile → link →
+pack → run), useful as a smoke test that your `libSDL2_wc.a` is good:
+
+```bash
+# 1. compile — real SDL2 headers
+emcc -O2 -sUSE_SDL=2 -I. -c game_cart.c     -o game_cart.o
+emcc -O2 -sUSE_SDL=2 -I. -c sdl2_wc/sdl2_gl_blit.c -o blit.o
+emcc -O2                  -c gl4es_stub.c   -o stub.o   # 2D-only carts; see Common Problems
+
+# 2. link — our SDL2, not Emscripten's
+emcc -O2 -sSTANDALONE_WASM=1 -sALLOW_MEMORY_GROWTH=1 --no-entry \
+    game_cart.o blit.o stub.o \
+    -L sdl2_wc/lib -lSDL2_wc -sUSE_SDL=0 \
+    -o cart.wasm
+
+# 3. pack + run (headless; writes a PNG you can eyeball)
+npx wasmcart pack --wasm cart.wasm --name "My Game" -o game.wasc
+npx wasmcart game.wasc --frames 40 --shot out.png
+```
+
+The cart calls `SDL_WASMCART_SetFramebuffer(fb, w, h)` in `wc_init()` before
+`SDL_Init`, then uses ordinary `SDL_CreateRenderer` / `SDL_RenderFillRect` /
+`SDL_RenderPresent` — the backend routes the result into the wasmcart
+framebuffer.
 
 Compare this to the hand-porting approach which requires weeks of:
 - Writing SDL/SFML compat headers
