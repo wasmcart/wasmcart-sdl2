@@ -77,6 +77,7 @@ static uint32_t *_wc_framebuffer_ptr = NULL;
 static int       _wc_fb_width = 0;
 static int       _wc_fb_height = 0;
 static SDL_Surface *_wc_window_surface = NULL;
+static SDL_Window *_wc_window = NULL;
 
 void SDL_WASMCART_SetFramebuffer(uint32_t *fb, int w, int h)
 {
@@ -326,6 +327,7 @@ static int WASMCART_CreateWindow(_THIS, SDL_Window *window)
     window->flags |= SDL_WINDOW_OPENGL;
 
     /* Set input focus so SDL_SendKeyboardKey/SDL_SendMouseMotion deliver events */
+    _wc_window = window;
     SDL_SetKeyboardFocus(window);
     SDL_SetMouseFocus(window);
 
@@ -423,34 +425,142 @@ static void push_key(SDL_Scancode scancode, Uint8 state)
     SDL_SendKeyboardKey(state, scancode);
 }
 
+/* absolute pointer (wasmcart pointer ABI): the host positions the cursor at an
+ * exact coord + clicks. Feeds SDL mouse motion/button events. */
+extern int wc_pointer_active(void) __attribute__((weak));
+extern int wc_pointer_x(void) __attribute__((weak));
+extern int wc_pointer_y(void) __attribute__((weak));
+extern int wc_pointer_buttons(void) __attribute__((weak));
+
+/*---------------------------------------------------------------------------*/
+/* Analog-cursor gamepad control (generic — works for any pointer-driven cart).
+ *
+ * The left stick drives a software cursor that we feed into SDL as mouse motion
+ * (same delivery path the absolute-pointer ABI uses). A = left click, B = right
+ * click at the cursor. This makes a mouse-UI game (menus + RTS unit control)
+ * playable on a couch gamepad — the console-RTS-port idiom (PS Vita/PS4
+ * Stratagus, Command & Conquer console ports, etc.).
+ *
+ * Tuning matches the stratagus-vita port: pow-curve acceleration on stick
+ * magnitude so a light push nudges precisely and a full push travels fast.
+ * L1 held = 2x speed boost. Right stick edge-scrolls the map via arrow keys.
+ */
+
+/* int16 stick range is -32768..32767 (wasmcart pad ABI == SDL axis range). */
+#define WC_STICK_DEADZONE_L   3000
+#define WC_STICK_DEADZONE_R   16000
+/* Speed tuning (matches stratagus-vita feel). Per-frame step ≈
+ * pow(axis,POW) * dt(16.6) * boost / SPEED_MOD * resScale. At full deflection
+ * (axis≈32767, pow≈36700) with 720p resScale (1.5): 36700*16.6*1.5/130000 ≈
+ * 7 px/frame ≈ ~420 px/s — a couch-comfortable full-screen traverse in ~3s,
+ * with the pow curve giving fine control on light pushes. */
+#define WC_CURSOR_SPEED_MOD   130000.0   /* larger = slower */
+#define WC_CURSOR_AXIS_POW    1.03       /* accel curve exponent */
+
+static float wc_cursor_x = -1.0f;   /* -1 = uninitialized (center on first use) */
+static float wc_cursor_y = -1.0f;
+
+/* Called once per rendered frame by the cart (e.g. Stratagus WaitEventsOneFrame).
+ * Integrates left-stick deflection into the software cursor and feeds SDL a
+ * single mouse-motion event per frame — framerate-correct, unlike the pump. */
+void SDL_WASMCART_UpdateAnalogCursor(void)
+{
+    if (!wc_pads_ptr || !wc_pads_ptr[0].connected) return;
+    /* If the host is driving an absolute pointer this frame, it owns the cursor. */
+    if (wc_pointer_active && wc_pointer_active()) return;
+
+    if (wc_cursor_x < 0.0f) { wc_cursor_x = wc_window_w * 0.5f; wc_cursor_y = wc_window_h * 0.5f; }
+
+    int16_t lx = wc_pads_ptr[0].left_x;
+    int16_t ly = wc_pads_ptr[0].left_y;
+    if (lx > -WC_STICK_DEADZONE_L && lx < WC_STICK_DEADZONE_L) lx = 0;
+    if (ly > -WC_STICK_DEADZONE_L && ly < WC_STICK_DEADZONE_L) ly = 0;
+    if (lx == 0 && ly == 0) return;
+
+    const double dt = 16.6;                 /* one ~60fps frame */
+    double resScale = (double)wc_window_h / 480.0;
+    double boost = (wc_pads_ptr[0].buttons & WC_BTN_L1) ? 2.0 : 1.0;
+    double sx = (lx > 0) ? 1.0 : -1.0;
+    double sy = (ly > 0) ? 1.0 : -1.0;
+    double ax = lx < 0 ? -(double)lx : (double)lx;
+    double ay = ly < 0 ? -(double)ly : (double)ly;
+    wc_cursor_x += (float)(SDL_pow(ax, WC_CURSOR_AXIS_POW) * sx * dt * boost / WC_CURSOR_SPEED_MOD * resScale);
+    wc_cursor_y += (float)(SDL_pow(ay, WC_CURSOR_AXIS_POW) * sy * dt * boost / WC_CURSOR_SPEED_MOD * resScale);
+
+    if (wc_cursor_x < 0) wc_cursor_x = 0;
+    else if (wc_cursor_x > wc_window_w - 1) wc_cursor_x = wc_window_w - 1;
+    if (wc_cursor_y < 0) wc_cursor_y = 0;
+    else if (wc_cursor_y > wc_window_h - 1) wc_cursor_y = wc_window_h - 1;
+
+    SDL_SetMouseFocus(_wc_window);
+    SDL_SendMouseMotion(_wc_window, 0, 0, (int)wc_cursor_x, (int)wc_cursor_y);
+}
+
 static void WASMCART_PumpEvents(_THIS)
 {
+    /* Absolute pointer (host-driven mouse/touch) takes priority when active —
+     * lets the romdev pointer op / a real touchscreen drive the cursor exactly. */
+    if (wc_pointer_active && wc_pointer_active()) {
+        static int prev_pbtn = 0;
+        int px = wc_pointer_x(), py = wc_pointer_y();
+        wc_cursor_x = px; wc_cursor_y = py;   /* keep the gamepad cursor in sync */
+        SDL_SetMouseFocus(_wc_window); SDL_SendMouseMotion(_wc_window, 0, 0, px, py);
+        int pb = wc_pointer_buttons();
+        if ((pb & 1) && !(prev_pbtn & 1)) SDL_SendMouseButton(_wc_window, 0, SDL_PRESSED, SDL_BUTTON_LEFT);
+        if (!(pb & 1) && (prev_pbtn & 1)) SDL_SendMouseButton(_wc_window, 0, SDL_RELEASED, SDL_BUTTON_LEFT);
+        if ((pb & 2) && !(prev_pbtn & 2)) SDL_SendMouseButton(_wc_window, 0, SDL_PRESSED, SDL_BUTTON_RIGHT);
+        if (!(pb & 2) && (prev_pbtn & 2)) SDL_SendMouseButton(_wc_window, 0, SDL_RELEASED, SDL_BUTTON_RIGHT);
+        prev_pbtn = pb;
+    }
+
     if (!wc_pads_ptr) return;
 
     uint16_t buttons = wc_pads_ptr[0].buttons;
     uint16_t pressed  = buttons & ~prev_buttons;
     uint16_t released = ~buttons & prev_buttons;
 
-    /* Map gamepad buttons to SDL keyboard scancodes.
-     * Neverball uses these keys for navigation and gameplay. */
+    /* NOTE: left-stick cursor integration is NOT done here. SDL_PumpEvents runs
+     * many times per rendered frame (SDL_PollEvent pumps whenever its queue
+     * drains), so integrating motion here would move the cursor ~30x too fast.
+     * The cart calls SDL_WASMCART_UpdateAnalogCursor() exactly once per frame
+     * (from WaitEventsOneFrame) for a stable, framerate-correct cursor speed. */
 
-    /* A → Return + Space (select/confirm/action) */
-    if (pressed & WC_BTN_A)  { push_key(SDL_SCANCODE_RETURN, SDL_PRESSED); push_key(SDL_SCANCODE_SPACE, SDL_PRESSED); }
-    if (released & WC_BTN_A) { push_key(SDL_SCANCODE_RETURN, SDL_RELEASED); push_key(SDL_SCANCODE_SPACE, SDL_RELEASED); }
+    /* --- A = left click, B = right click (at the analog cursor) --- */
+    if (pressed & WC_BTN_A)  { SDL_SetMouseFocus(_wc_window); SDL_SendMouseButton(_wc_window, 0, SDL_PRESSED,  SDL_BUTTON_LEFT); }
+    if (released & WC_BTN_A) { SDL_SendMouseButton(_wc_window, 0, SDL_RELEASED, SDL_BUTTON_LEFT); }
+    if (pressed & WC_BTN_B)  { SDL_SetMouseFocus(_wc_window); SDL_SendMouseButton(_wc_window, 0, SDL_PRESSED,  SDL_BUTTON_RIGHT); }
+    if (released & WC_BTN_B) { SDL_SendMouseButton(_wc_window, 0, SDL_RELEASED, SDL_BUTTON_RIGHT); }
 
-    /* B → Escape (back/cancel) */
-    if (pressed & WC_BTN_B)  push_key(SDL_SCANCODE_ESCAPE, SDL_PRESSED);
-    if (released & WC_BTN_B) push_key(SDL_SCANCODE_ESCAPE, SDL_RELEASED);
+    /* --- Right stick → map edge-scroll via arrow keys (held while deflected) --- */
+    {
+        static uint16_t rscroll_prev = 0;  /* bit0=L bit1=R bit2=U bit3=D */
+        int16_t rx = wc_pads_ptr[0].right_x;
+        int16_t ry = wc_pads_ptr[0].right_y;
+        uint16_t rs = 0;
+        if (rx >  WC_STICK_DEADZONE_R) rs |= 2;
+        if (rx < -WC_STICK_DEADZONE_R) rs |= 1;
+        if (ry >  WC_STICK_DEADZONE_R) rs |= 8;
+        if (ry < -WC_STICK_DEADZONE_R) rs |= 4;
+        uint16_t rchg = rs ^ rscroll_prev;
+        if (rchg & 1) push_key(SDL_SCANCODE_LEFT,  (rs & 1) ? SDL_PRESSED : SDL_RELEASED);
+        if (rchg & 2) push_key(SDL_SCANCODE_RIGHT, (rs & 2) ? SDL_PRESSED : SDL_RELEASED);
+        if (rchg & 4) push_key(SDL_SCANCODE_UP,    (rs & 4) ? SDL_PRESSED : SDL_RELEASED);
+        if (rchg & 8) push_key(SDL_SCANCODE_DOWN,  (rs & 8) ? SDL_PRESSED : SDL_RELEASED);
+        rscroll_prev = rs;
+    }
 
-    /* X → Space (alternate action) */
+    /* Start = Return/Enter (skips intro splash, confirms dialogs). */
+    if (pressed & WC_BTN_START)  { push_key(SDL_SCANCODE_RETURN, SDL_PRESSED); }
+    if (released & WC_BTN_START) { push_key(SDL_SCANCODE_RETURN, SDL_RELEASED); }
+    /* Select = Escape (back/cancel/game menu) */
+    if (pressed & WC_BTN_SELECT)  push_key(SDL_SCANCODE_ESCAPE, SDL_PRESSED);
+    if (released & WC_BTN_SELECT) push_key(SDL_SCANCODE_ESCAPE, SDL_RELEASED);
+
+    /* X → Space (RTS: often stop / no-op action / rotate) */
     if (pressed & WC_BTN_X)  push_key(SDL_SCANCODE_SPACE, SDL_PRESSED);
     if (released & WC_BTN_X) push_key(SDL_SCANCODE_SPACE, SDL_RELEASED);
 
-    /* Start → F10 (neverball uses F10 for pause) */
-    if (pressed & WC_BTN_START)  push_key(SDL_SCANCODE_F10, SDL_PRESSED);
-    if (released & WC_BTN_START) push_key(SDL_SCANCODE_F10, SDL_RELEASED);
-
-    /* D-pad → Arrow keys (menu navigation) */
+    /* D-pad → Arrow keys (menu navigation fallback / discrete map scroll) */
     if (pressed & WC_BTN_UP)    push_key(SDL_SCANCODE_UP, SDL_PRESSED);
     if (released & WC_BTN_UP)   push_key(SDL_SCANCODE_UP, SDL_RELEASED);
     if (pressed & WC_BTN_DOWN)  push_key(SDL_SCANCODE_DOWN, SDL_PRESSED);
@@ -460,19 +570,8 @@ static void WASMCART_PumpEvents(_THIS)
     if (pressed & WC_BTN_RIGHT) push_key(SDL_SCANCODE_RIGHT, SDL_PRESSED);
     if (released & WC_BTN_RIGHT)push_key(SDL_SCANCODE_RIGHT, SDL_RELEASED);
 
-    /* Shoulder buttons → page up/down or screenshot */
-    if (pressed & WC_BTN_L1)  push_key(SDL_SCANCODE_PAGEUP, SDL_PRESSED);
-    if (released & WC_BTN_L1) push_key(SDL_SCANCODE_PAGEUP, SDL_RELEASED);
-    if (pressed & WC_BTN_R1)  push_key(SDL_SCANCODE_PAGEDOWN, SDL_PRESSED);
-    if (released & WC_BTN_R1) push_key(SDL_SCANCODE_PAGEDOWN, SDL_RELEASED);
-
-    /* X → Space (used for camera rotation in some states) */
-    if (pressed & WC_BTN_X)  push_key(SDL_SCANCODE_SPACE, SDL_PRESSED);
-    if (released & WC_BTN_X) push_key(SDL_SCANCODE_SPACE, SDL_RELEASED);
-
-    /* Select → Tab */
-    if (pressed & WC_BTN_SELECT)  push_key(SDL_SCANCODE_TAB, SDL_PRESSED);
-    if (released & WC_BTN_SELECT) push_key(SDL_SCANCODE_TAB, SDL_RELEASED);
+    /* R1 = speed-boost modifier only (handled above); no key. L1 reserved.
+     * (Both shoulders are free for in-game bindings later.) */
 
     prev_buttons = buttons;
 
