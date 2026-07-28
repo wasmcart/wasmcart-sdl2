@@ -1203,7 +1203,9 @@ only *calls* them behind runtime guards, so they must resolve even for a cart
 that never touches GL.
 
 - `wc_sdl_gl_blit` is provided by `sdl2_wc/sdl2_gl_blit.c` — compile and link
-  that file alongside your cart.
+  that file alongside your cart. It `#include`s `wc_gl_blit.h`, so it needs the
+  main repo's `include/` on the header path (`-I$WC/include`) or it fails with
+  `fatal error: 'wc_gl_blit.h' file not found`.
 - The two `gl4es_*` symbols come from gl4es, which only GL1.x ports link. A
   2D-only cart can satisfy them with no-op stubs:
 
@@ -2140,11 +2142,16 @@ Note the build trick: `-sUSE_SDL=2` at compile time (for headers), then
 A complete, minimal build that is known to work end-to-end (compile → link →
 pack → run), useful as a smoke test that your `libSDL2_wc.a` is good:
 
+`$WC` is a checkout of the main wasmcart repo; its `include/` supplies
+`wasmcart.h` and `wc_gl_blit.h`.
+
 ```bash
+WC=/path/to/wasmcart
+
 # 1. compile — real SDL2 headers
-emcc -O2 -sUSE_SDL=2 -I. -c game_cart.c     -o game_cart.o
-emcc -O2 -sUSE_SDL=2 -I. -c sdl2_wc/sdl2_gl_blit.c -o blit.o
-emcc -O2                  -c gl4es_stub.c   -o stub.o   # 2D-only carts; see Common Problems
+emcc -O2 -sUSE_SDL=2 -I. -I$WC/include -c game_cart.c            -o game_cart.o
+emcc -O2 -sUSE_SDL=2 -I. -I$WC/include -c sdl2_wc/sdl2_gl_blit.c -o blit.o
+emcc -O2                               -c gl4es_stub.c           -o stub.o   # 2D-only; see Common Problems
 
 # 2. link — our SDL2, not Emscripten's
 emcc -O2 -sSTANDALONE_WASM=1 -sALLOW_MEMORY_GROWTH=1 --no-entry \
