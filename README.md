@@ -49,12 +49,10 @@ SDK (`wc_fb.h`, `wc_gl.h`, math/mixer helpers) live in the main
 [wasmcart](https://github.com/wasmcart/wasmcart) repo's `include/`. This repo
 depends on that contract; it does not redefine it.
 
-> **Note:** `wc_cart.h` includes `wasmcart.h` (the raw ABI header with the
-> `wc_info_t` / `wc_pad_t` struct definitions), which is not currently published
-> in either repo — it travels with existing ports. Until it ships in the main
-> repo's `include/`, copy it from a port you have, or work from the struct
-> layouts in [SPEC.md](https://github.com/wasmcart/wasmcart/blob/main/SPEC.md),
-> which are normative.
+Include `wasmcart.h` (the ABI header: structs, flags, GL + host imports) first,
+then `wc_cart.h` for the boilerplate macros. Note the three export macros are not
+interchangeable — `WC_EXPORT` is for `wc_get_info` only, with `WC_EXPORT_INIT` and
+`WC_EXPORT_RENDER` for the other two.
 
 ## Third-party
 

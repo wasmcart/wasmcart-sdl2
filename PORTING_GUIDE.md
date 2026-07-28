@@ -28,8 +28,9 @@ to its ring buffer. The host reads pixels and audio after `wc_render()` returns.
 
 - **Emscripten SDK** (emcc) — install from https://emscripten.org
 - **wasmcart.h** — the ABI header, plus the cart-author SDK (`wc_cart.h`, `wc_fb.h`,
-  `wc_gl.h`, math/mixer helpers) from the main
-  [wasmcart](https://github.com/wasmcart/wasmcart) repo's `include/`
+  `wc_gl.h`, math/mixer helpers), all in the main
+  [wasmcart](https://github.com/wasmcart/wasmcart) repo's `include/`. Include
+  `wasmcart.h` first, then `wc_cart.h`.
 - **wasmcart** — the CLI, for packing and running carts: `npx wasmcart`
 
 ## Choosing a Format
