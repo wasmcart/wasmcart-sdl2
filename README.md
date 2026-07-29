@@ -28,6 +28,7 @@ for one class of cart author (people porting existing SDL2 games).
 sdl2_wc/              wasmcart-native SDL2 backend (video + audio + GL blit)
   SDL_wasmcart_video.c    SDL2 video backend → wasmcart framebuffer / GL
   SDL_wasmcart_audio.c    SDL2 audio backend → wasmcart audio ring
+  SDL_wasmcart_joystick.c SDL2 joystick backend → wasmcart pads, and rumble back out
   SDL_config_wasmcart.h   SDL2 build config for the wasmcart target
   sdl2_gl_blit.c          uploads the software-rendered surface as a GL texture
   build_sdl2_wc.sh        builds libSDL2_wc.a with Emscripten
@@ -92,6 +93,31 @@ Two traps this recipe steps around, both covered in
   void  gl4es_bridge_set_size(int w, int h) { (void)w; (void)h; }
   void *wc_gl4es_GetProcAddress(const char *p) { (void)p; return 0; }
   ```
+
+## Input and rumble
+
+Pad state reaches a game two ways, both live at once:
+
+- the **video backend** translates pad buttons into SDL keyboard events, so a
+  game that only reads the keyboard works with no changes
+- the **joystick backend** surfaces `wc_pads[]` as real SDL devices, giving
+  `SDL_JoystickGetAxis`/`GetButton`/`GetHat` and a built-in gamepad mapping
+
+Rumble runs the other way, cart to host, which is why the joystick subsystem
+is enabled at all: it cannot travel through the shared pad struct. A game
+calls `SDL_JoystickRumble()` (or `SDL_GameControllerRumble()`) and the backend
+forwards it to the `wc_pad_rumble` host import.
+
+Capability is per-device, so ask rather than assume. The call returns non-zero
+only when the pad has motors, and a headless run with no rumble handler wired
+is one of the cases where it does not.
+
+SDL's haptic subsystem stays disabled: that API is for force-feedback devices,
+not the two-motor rumble games actually use.
+
+Devices appear once the host has written pad state, which is after `wc_init`.
+Enumerate per frame rather than once at startup, which is what correct
+hot-plug handling looks like anyway.
 
 ## The cart contract
 
