@@ -153,8 +153,20 @@
 #define SDL_AUDIO_DRIVER_WASMCART 1
 #define SDL_AUDIO_DRIVER_DUMMY 1
 
-/* Joystick: disabled (input pushed via PumpEvents from wc_pads) */
-#define SDL_JOYSTICK_DISABLED 1
+/* Joystick: wasmcart backend, reading the same wc_pads[] the video backend
+ * translates into keyboard events. Both paths run: a game that only reads keys
+ * is unaffected, and one that opens a joystick gets axes, buttons and rumble.
+ *
+ * Rumble is why the subsystem is on at all. It is the one input feature that
+ * runs cart-to-host, so it cannot be pushed through the shared pad struct, and
+ * with the subsystem compiled out SDL_InitSubSystem(SDL_INIT_JOYSTICK) fails
+ * outright -- which puts SDL_JoystickRumble() and pygame's Joystick.rumble()
+ * permanently out of reach. */
+#define SDL_JOYSTICK_WASMCART 1
+
+/* Haptic stays off: SDL's haptic API is the force-feedback-device path
+ * (SDL_HapticOpenFromJoystick and friends), not the two-motor rumble games
+ * actually use. The joystick driver's Rumble entry point is the whole ABI. */
 
 /* Sensor: disabled */
 #define SDL_SENSOR_DISABLED 1

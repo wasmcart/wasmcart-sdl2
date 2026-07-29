@@ -95,7 +95,7 @@ joystick/dummy/SDL_sysjoystick.c
 # Note: we intentionally EXCLUDE:
 #   video/emscripten/* (replaced by our wasmcart video backend)
 #   audio/emscripten/* (replaced by our wasmcart audio backend)
-#   joystick/emscripten/* (joystick disabled, events from PumpEvents)
+#   joystick/emscripten/* (replaced by our wasmcart joystick backend)
 #   power/emscripten/* (not needed)
 #   filesystem/emscripten/* (game has its own FS)
 #   locale/emscripten/* (not needed)
@@ -114,10 +114,12 @@ echo "Patching SDL2 for wasmcart backend registration..."
 # We patch IN the SDL2 source tree (temporary, reverted after compile)
 SDL_VIDEO_C="$SDL2_SRC/src/video/SDL_video.c"
 SDL_AUDIO_C="$SDL2_SRC/src/audio/SDL_audio.c"
+SDL_JOYSTICK_C="$SDL2_SRC/src/joystick/SDL_joystick.c"
 
 # Backup originals
 cp "$SDL_VIDEO_C" "$SDL_VIDEO_C.orig"
 cp "$SDL_AUDIO_C" "$SDL_AUDIO_C.orig"
+cp "$SDL_JOYSTICK_C" "$SDL_JOYSTICK_C.orig"
 
 # Patch SDL_video.c: add wasmcart extern + bootstrap entry
 sed -i '/extern VideoBootStrap Emscripten_bootstrap;/a extern VideoBootStrap WASMCART_bootstrap;' "$SDL_VIDEO_C"
@@ -127,13 +129,26 @@ sed -i '/#ifdef SDL_VIDEO_DRIVER_DUMMY/i #ifdef SDL_VIDEO_DRIVER_WASMCART\n    \
 sed -i '/extern AudioBootStrap EMSCRIPTENAUDIO_bootstrap;/a extern AudioBootStrap WASMCARTAUDIO_bootstrap;' "$SDL_AUDIO_C"
 sed -i '/#ifdef SDL_AUDIO_DRIVER_DUMMY/i #ifdef SDL_AUDIO_DRIVER_WASMCART\n    \&WASMCARTAUDIO_bootstrap,\n#endif' "$SDL_AUDIO_C"
 
-# Also need to patch SDL_sysvideo.h and SDL_sysaudio.h for extern declarations
+# Patch SDL_joystick.c: put our driver in the driver table.
+#
+# It goes FIRST rather than beside the dummy entry. The table is scanned in
+# order and the dummy driver is the "no joysticks exist" fallback -- behind it,
+# ours would still be reached, but the ordering would say the fallback is the
+# real backend. With SDL_JOYSTICK_WASMCART defined and SDL_JOYSTICK_DISABLED
+# not, the dummy entry compiles out entirely and this is the only driver.
+sed -i '/^static SDL_JoystickDriver \*SDL_joystick_drivers\[\] = {/a #ifdef SDL_JOYSTICK_WASMCART\n    \&SDL_WASMCART_JoystickDriver,\n#endif' "$SDL_JOYSTICK_C"
+
+# Also need to patch SDL_sysvideo.h, SDL_sysaudio.h and SDL_sysjoystick.h for
+# extern declarations
 SDL_SYSVIDEO_H="$SDL2_SRC/src/video/SDL_sysvideo.h"
 SDL_SYSAUDIO_H="$SDL2_SRC/src/audio/SDL_sysaudio.h"
+SDL_SYSJOYSTICK_H="$SDL2_SRC/src/joystick/SDL_sysjoystick.h"
 cp "$SDL_SYSVIDEO_H" "$SDL_SYSVIDEO_H.orig"
 cp "$SDL_SYSAUDIO_H" "$SDL_SYSAUDIO_H.orig"
+cp "$SDL_SYSJOYSTICK_H" "$SDL_SYSJOYSTICK_H.orig"
 sed -i '/extern VideoBootStrap Emscripten_bootstrap;/a extern VideoBootStrap WASMCART_bootstrap;' "$SDL_SYSVIDEO_H"
 sed -i '/extern AudioBootStrap EMSCRIPTENAUDIO_bootstrap;/a extern AudioBootStrap WASMCARTAUDIO_bootstrap;' "$SDL_SYSAUDIO_H"
+sed -i '/extern SDL_JoystickDriver SDL_EMSCRIPTEN_JoystickDriver;/a extern SDL_JoystickDriver SDL_WASMCART_JoystickDriver;' "$SDL_SYSJOYSTICK_H"
 
 echo "Compiling SDL2 core files..."
 
@@ -151,8 +166,10 @@ done
 # Restore original SDL2 sources
 mv "$SDL_VIDEO_C.orig" "$SDL_VIDEO_C"
 mv "$SDL_AUDIO_C.orig" "$SDL_AUDIO_C"
+mv "$SDL_JOYSTICK_C.orig" "$SDL_JOYSTICK_C"
 mv "$SDL_SYSVIDEO_H.orig" "$SDL_SYSVIDEO_H"
 mv "$SDL_SYSAUDIO_H.orig" "$SDL_SYSAUDIO_H"
+mv "$SDL_SYSJOYSTICK_H.orig" "$SDL_SYSJOYSTICK_H"
 
 # Compile our wasmcart backends (copy into SDL2 source tree so relative includes work)
 echo "Compiling wasmcart video backend..."
@@ -160,6 +177,12 @@ mkdir -p "$SDL2_SRC/src/video/wasmcart"
 cp "$HERE/SDL_wasmcart_video.c" "$SDL2_SRC/src/video/wasmcart/"
 emcc $CFLAGS -c "$SDL2_SRC/src/video/wasmcart/SDL_wasmcart_video.c" -o "obj/sdl2/SDL_wasmcart_video.o"
 rm -rf "$SDL2_SRC/src/video/wasmcart"
+
+echo "Compiling wasmcart joystick backend..."
+mkdir -p "$SDL2_SRC/src/joystick/wasmcart"
+cp "$HERE/SDL_wasmcart_joystick.c" "$SDL2_SRC/src/joystick/wasmcart/"
+emcc $CFLAGS -c "$SDL2_SRC/src/joystick/wasmcart/SDL_wasmcart_joystick.c" -o "obj/sdl2/SDL_wasmcart_joystick.o"
+rm -rf "$SDL2_SRC/src/joystick/wasmcart"
 
 echo "Compiling wasmcart audio backend..."
 mkdir -p "$SDL2_SRC/src/audio/wasmcart"
