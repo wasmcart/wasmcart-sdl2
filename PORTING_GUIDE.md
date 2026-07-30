@@ -410,6 +410,8 @@ That gives you bytes. A game wants *files*, so
 handful of named ones, letting a port keep its `fopen`/`fread`/`fwrite` calls:
 
 ```c
+/* In EXACTLY ONE .c file. Other files just #include the header. */
+#define WC_SAVEFS_IMPLEMENTATION
 #include "wc_sdl_savefs.h"
 
 void wc_init(void) {
@@ -443,6 +445,51 @@ between two sessions.
 **Sizing.** `WC_SAVEFS_BYTES` defaults to the header plus 60KB. Hosts persist
 this region on every save, so keep it to what the game needs rather than
 declaring a megabyte.
+
+### Four traps, all of which cost real debugging time
+
+**Define `WC_SAVEFS_IMPLEMENTATION` in exactly one .c file.** Most ports include
+this header from two places — the cart entry points, and the file shim. Without
+the define the bodies do not compile at all; with it in *both*, you get two
+independent save filesystems. That second failure is vicious: whichever file
+called `wc_savefs_init()` works, the other is left with `cap == 0`, and a
+zero-capacity `fmemopen()` stream means **`fopen` succeeds and every `fwrite`
+short-writes**. The game prints "failed to write" and every save silently
+vanishes. `test/savefs_test.c` covers this with a second translation unit.
+
+**Save on suspend, not on exit.** Games write their config on the way out of
+`main()`, and a cart never gets there — the host just stops calling `wc_render()`.
+Export `wc_on_suspend` and save from it, or a session's settings and high scores
+never reach the region:
+
+```c
+__attribute__((export_name("wc_on_suspend")))
+void wc_on_suspend(void) { if (started) saveConfiguration(); }
+```
+
+Remember to add it to `EXPORTED_FUNCTIONS`, and guard on "the game actually
+started" so a suspend during startup cannot overwrite what the host restored.
+
+**`fsync(fileno(f))` does not return.** Save code often brackets a write with
+`mkdir()` and `fsync(fileno(f))`. A save handle is an `fmemopen()` stream with no
+underlying descriptor, so `fileno()` gives -1 and the `fsync` hangs. Both calls
+are meaningless in a cart — the host owns durability — so stub them, and stub
+them *after* `<sys/stat.h>` and `<unistd.h>` are included or the macros mangle
+libc's own declarations:
+
+```c
+#include <sys/stat.h>
+#include <unistd.h>
+#define mkdir(...) (0)
+#define fsync(fd)  (0)
+```
+
+**Do not macro `fclose` into this header's path.** Routing a game's 30-odd
+`fclose()` calls to `wc_savefs_fclose()` with a macro is the sensible way to hook
+them all, but this header calls `fclose()` internally too — so the macro turns
+those into infinite recursion. The header `#undef`s `fclose` and `fopen` at its
+top to stay immune. If you write a similar layer, do the same: the symptom is a
+silent hang at *cart load*, which looks nothing like a save bug.
 
 ## Detailed Porting Steps
 
@@ -917,60 +964,131 @@ static void scale_to_framebuffer(void) {
 
 ## Networking (ABI v3)
 
-Carts can open WebSocket connections and communicate peer-to-peer via data channels. All networking is opt-in via manifest fields.
+A cart networks through **one** API: `wc_peer_*`. It is deliberately
+transport-agnostic — a peer the host hands the cart is the same object whether it
+arrived over WebRTC, a WebSocket relay, a LAN socket or a serial cable, and the
+cart cannot tell which. Earlier ABIs had separate `wc_ws_*` and `wc_dc_*`
+families; **both are gone**, merged into the peer family. See
+[SPEC.md](https://github.com/wasmcart/wasmcart/blob/main/SPEC.md), *Peer
+Connection*, and
+[docs/networking.md](https://github.com/wasmcart/wasmcart/blob/main/docs/networking.md).
 
-### WebSocket
-
-Declare allowed domains in the manifest:
-```json
-{ "net": { "websocket": ["api.mygame.com", "leaderboard.example.com"] } }
-```
-
-Cart imports (calls into host):
 ```c
-#define WC_USE_NET_WS
+#define WC_USE_NET_PEER
 #include "wasmcart.h"
 
-// Open, send, close — all synchronous calls
-int32_t conn = wc_ws_open("wss://api.mygame.com/game", 34);
-wc_ws_send_text(conn, json_buf, json_len);
-wc_ws_close(conn, 1000);
+int  wc_peer_open(const char *addr, unsigned int addr_len);  /* dial out */
+void wc_peer_close(int peer_id);
+int  wc_peer_send(int peer_id, const void *data, unsigned int len);
+int  wc_peer_broadcast(const void *data, unsigned int len);  /* to connected peers */
+int  wc_peer_count(void);
+int  wc_peer_id(unsigned int index);
+int  wc_peer_state(int peer_id);
+int  wc_peer_name(int peer_id, char *dest, unsigned int max_len);
+int  wc_peer_transport(int peer_id);
 ```
 
-Cart exports (host calls into cart — all optional):
+Exports the host calls into the cart (all optional):
+
 ```c
-void wc_ws_on_open(int32_t conn_id) { /* connected */ }
-void wc_ws_on_message(int32_t conn_id, const void* data, uint32_t len) { /* binary */ }
-void wc_ws_on_message_text(int32_t conn_id, const char* str, uint32_t len) { /* text */ }
-void wc_ws_on_close(int32_t conn_id, uint32_t code) { /* closed */ }
-void wc_ws_on_error(int32_t conn_id) { /* error */ }
+__attribute__((export_name("wc_peer_on_open")))
+void wc_peer_on_open(int peer_id) {}
+__attribute__((export_name("wc_peer_on_message")))
+void wc_peer_on_message(int peer_id, const void *data, unsigned int len) {}
+__attribute__((export_name("wc_peer_on_close")))
+void wc_peer_on_close(int peer_id) {}
+__attribute__((export_name("wc_peer_on_error")))
+void wc_peer_on_error(int peer_id, const void *msg, unsigned int len) {}
 ```
 
-Events are delivered at the start of each frame, before `wc_render()`. The host validates URLs against the manifest allowlist — connections to non-listed domains are rejected.
+Add them to `EXPORTED_FUNCTIONS` or the linker drops them.
 
-### Data Channels (Peer-to-Peer)
+### The gate has two halves
 
-Declare in the manifest:
+The cart sets `WC_FLAG_NET_PEER` in `wc_get_info()`, **and** the manifest grants
+domains:
+
 ```json
-{ "net": { "data-channel": true } }
+{ "net": { "domains": ["relay.example.com"] } }
 ```
 
-The host manages connections (WebRTC, TCP relay, etc.) and exposes them as peer IDs:
+`wasmcart-pack --ws <domain>` writes that grant (bare domain, no port). Both
+halves are required for `wc_peer_open()` to dial out — the flag alone grants
+nothing.
+
+**Peers the host supplies need no grant.** A host that puts the cart in a session
+itself (`addPeer()` — a lobby, a matchmaker, a relay room) is not the cart
+reaching out, so there is nothing to allowlist. This is the better path for a game
+port: the cart declares the flag, ships with no domain baked in, and multiplayer
+works wherever the host arranges it.
+
+### Porting an SDL_net game: `wc_sdl_net.h`
+
+Most classic SDL games with multiplayer use SDL_net's UDP calls. There are no
+sockets in a cart, but a UDP datagram maps onto a peer message almost unchanged —
+both are discrete, bounded, unordered and unreliable — and such games already do
+their own sequencing and acknowledgement, so they tolerate a peer transport for
+exactly the reasons they tolerate UDP.
+
+[`include/wc_sdl_net.h`](include/wc_sdl_net.h) implements the SDL_net surface
+those games call, over `wc_peer_*`. Point the game's `#include "SDL_net.h"` at it
+for cart builds and the netcode compiles **unmodified**:
+
 ```c
-#define WC_USE_NET_DC
-#include "wasmcart.h"
-
-int32_t count = wc_dc_peer_count();
-wc_dc_send(peer_id, data, len);
-wc_dc_broadcast(data, len);  // send to all peers
+#ifdef WASM_CART
+#  include "wc_sdl_net.h"
+#else
+#  include "SDL_net.h"
+#endif
 ```
 
-Cart exports (optional):
+Then, in exactly one .c file:
+
 ```c
-void wc_dc_on_connect(int32_t peer_id, const char* label, uint32_t label_len) {}
-void wc_dc_on_message(int32_t peer_id, const void* data, uint32_t len) {}
-void wc_dc_on_disconnect(int32_t peer_id) {}
+#define WC_SDL_NET_IMPLEMENTATION
+#include "wc_sdl_net.h"
 ```
+
+and call `wc_net_pump()` once per frame from wherever the game polls for packets
+(its own network-poll function is the right place — no new call sites).
+
+Covered: `SDLNet_Init`/`Quit`, `UDP_Open`/`Close`/`Bind`/`Unbind`,
+`UDP_Send`/`Recv`, `AllocPacket`/`FreePacket`, `ResolveHost`, `GetError`, and the
+`Read16`/`Write16`/`Read32`/`Write32` byte-order helpers — with SDL_net's return
+conventions preserved (`UDP_Send` returns 1 on success, `UDP_Recv` returns 1/0/-1).
+[`test/net_test.c`](test/net_test.c) covers the queueing, ordering, overflow and
+truncation paths against a stub peer layer.
+
+**Addressing does not map, and that is fine.** SDL_net names a host and port;
+`wc_peer_*` names an opaque peer id, and the host decides what an address even
+means. `SDLNet_ResolveHost()` stashes the string for `wc_peer_open()` to
+interpret; the numeric host/port a game computes are meaningless here. In
+practice, take the host-supplied peer path and you never touch addressing.
+
+**Peer discovery does not map at all.** SDL_net games find each other with UDP
+broadcast or multicast. **A browser cannot send either** — there is no API, at any
+privilege level — so no shim can paper over it. A host wanting LAN-style discovery
+has to virtualise it (a rendezvous server, a relay room, a signalling channel) and
+expose the results as peers. `wc_peer_broadcast()` sends to peers *already
+connected*; it is not a discovery mechanism. Plan for "the host puts you in a
+session", not "search the network for a game".
+
+### Deciding single-player vs networked without a command line
+
+Upstream games usually select multiplayer from `argv`, which a cart has none of.
+Check whether the host actually gave you a peer:
+
+```c
+if (wc_peer_count() > 0)
+    game_main(3, (char *[]){ "game", "--net", "peer:1", NULL });
+else
+    game_main(1, (char *[]){ "game", NULL });
+```
+
+Peers only exist if the host arranged them, so a cart launched normally plays
+single-player and one launched into a session plays networked, with no UI either
+way. Note the ordering constraint: the cart reads this on its **first frame**, so
+the host must register peers before the first `wc_render()`.
 
 ## OpenGL ES 3.0 Carts
 
@@ -1629,8 +1747,10 @@ references but are never called at runtime. Needed whenever building with
 | `porting/include/wc_mat4.h` | 4x4 matrix operations (requires wc_math.h) | GL carts |
 | `porting/include/wc_vec3.h` | 3D vector operations (requires wc_math.h) | GL carts |
 | `porting/include/wc_pcm_mixer.h` | Multi-channel PCM mixer + WAV parser | Any cart with sound effects |
-| `porting/include/wc_sdl_stubs.h` | SDL2 type definitions + no-op function stubs | Porting SDL2 games |
-| `porting/include/stb_image.h` | PNG/JPEG image decoder | GL carts with textures |
+| `include/wc_sdl_stubs.h` | SDL2 type definitions + no-op function stubs | Porting SDL2 games |
+| `include/wc_sdl_savefs.h` | Named files over the save region (config, progress) | Any port that saves anything |
+| `include/wc_sdl_net.h` | SDL_net UDP API over `wc_peer_*` | Porting a game with SDL_net multiplayer |
+| `include/stb_image.h` | PNG/JPEG image decoder | GL carts with textures |
 | `porting/audio_bridge.h` | Audio bridge header | When using SDL2_mixer |
 | `porting/audio_bridge.c` | SDL_mixer → ring buffer bridge with resampler | When using SDL2_mixer |
 | `porting/emstubs.c` | 200+ no-op stubs for emscripten/EGL/GL symbols | When using emscripten's SDL2 port |
@@ -1648,12 +1768,13 @@ wasmcart-pack --wasm cart.wasm --assets assets/ --name "My Game" --version "1.0.
 wasmcart-pack --wasm cart.wasm -o game.wasc
 
 # ABI v3 features
-wasmcart-pack --wasm cart.wasm -o game.wasc --pointer          # enable pointer input
-wasmcart-pack --wasm cart.wasm -o game.wasc --keyboard         # enable raw keyboard input
 wasmcart-pack --wasm cart.wasm -o game.wasc --players 4        # local multiplayer (1-4)
-wasmcart-pack --wasm cart.wasm -o game.wasc --ws api.example.com  # WebSocket allowlist (repeatable)
-wasmcart-pack --wasm cart.wasm -o game.wasc --data-channel     # enable peer-to-peer data channels
+wasmcart-pack --wasm cart.wasm -o game.wasc --ws relay.example.com  # net grant (bare domain, repeatable)
 ```
+
+`--pointer`, `--keyboard` and `--data-channel` are deprecated no-ops. Pointer and
+keyboard are declared by the cart (`WC_FLAG_POINTER`, `WC_FLAG_KEYBOARD`) rather
+than the manifest, and host-supplied peers need no grant at all.
 
 ## Examples
 

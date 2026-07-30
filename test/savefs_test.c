@@ -1,3 +1,4 @@
+#define WC_SAVEFS_IMPLEMENTATION
 /*
  * savefs_test.c — does wc_sdl_savefs.h actually persist saves?
  *
@@ -83,6 +84,24 @@ int main(void) {
     ck("shrinking one file preserves the next", n == 300 && memcmp(rb, prog, 300) == 0);
 
     ck("unknown file returns NULL", wc_savefs_fopen("nope.dat", "rb") == NULL);
+
+    /* The regression that motivated the WC_SAVEFS_IMPLEMENTATION split: a second
+     * file including the header must share THIS filesystem, not get its own.
+     * With per-file state its fopen still succeeds but cap is 0, so the write
+     * short-writes and nothing is ever stored. */
+    extern int savefs_other_tu_write(const char *name, const void *data, unsigned len);
+    extern int savefs_other_tu_exists(const char *name);
+    const char *from_other = "written from another translation unit";
+    const int rc = savefs_other_tu_write("other.dat", from_other, (unsigned)strlen(from_other));
+    ck("a second TU can write (shared state)", rc == 0);
+    ck("a second TU sees this TU's files", savefs_other_tu_exists("game.cfg"));
+
+    memset(rb, 0, sizeof rb);
+    f = wc_savefs_fopen("other.dat", "rb");
+    n = f ? fread(rb, 1, sizeof rb, f) : 0;
+    if (f) wc_savefs_fclose(f);
+    ck("this TU reads what the other TU wrote",
+       n == strlen(from_other) && memcmp(rb, from_other, n) == 0);
 
     printf(fails ? "\nFAILED (%d)\n" : "\nall checks passed\n", fails);
     return fails ? 1 : 0;

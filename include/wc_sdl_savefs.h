@@ -44,6 +44,24 @@
  *
  * The host persists the region on its own schedule, so a cart does not need to
  * ask. Closing a write handle only updates the blob.
+ *
+ * ONE translation unit, or define WC_SAVEFS_IMPLEMENTATION in exactly one
+ * -----------------------------------------------------------------------
+ * The state below used to be plain `static`, which meant a cart that included
+ * this header from two .c files silently got TWO independent save filesystems.
+ * The symptom is vicious: whichever file calls wc_savefs_init() initialises its
+ * own copy, the other one is left with cap == 0, and its writes go to a
+ * zero-capacity fmemopen() stream -- so fopen SUCCEEDS, fwrite short-writes, and
+ * the game reports "failed to write" while every save silently vanishes.
+ *
+ * So the state is now extern, declared here and defined only where
+ * WC_SAVEFS_IMPLEMENTATION is set. Put that define in exactly one .c file:
+ *
+ *   #define WC_SAVEFS_IMPLEMENTATION
+ *   #include "wc_sdl_savefs.h"
+ *
+ * Other files include the header normally and share that one filesystem. A cart
+ * that only includes it once needs the define in that one file.
  */
 
 #ifndef WC_SDL_SAVEFS_H
@@ -53,6 +71,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * A port that routes the game's fclose() to wc_savefs_fclose() with a macro --
+ * the usual way to hook 30-odd call sites at once -- would otherwise make THIS
+ * file's own fclose() calls recurse into wc_savefs_fclose() forever. It is a
+ * silent hang, not a crash, and it happens at cart load rather than at save time,
+ * so it looks nothing like a save bug.
+ *
+ * Undefining here means the layer always reaches the real stdio, whatever the
+ * including file has done to the name.
+ */
+#undef fclose
+#undef fopen
 
 #ifndef WC_SAVEFS_MAX_FILES
 #define WC_SAVEFS_MAX_FILES 8
@@ -66,6 +97,15 @@
 #ifndef WC_SAVEFS_BYTES
 #define WC_SAVEFS_BYTES (WC_SAVEFS_HEADER + 60 * 1024)
 #endif
+
+/* Declarations. Always visible; the bodies below compile in the one file that
+ * defines WC_SAVEFS_IMPLEMENTATION. */
+void  wc_savefs_init(void *region, uint32_t bytes);
+FILE *wc_savefs_fopen(const char *name, const char *mode);
+int   wc_savefs_fclose(FILE *fp);
+int   wc_savefs_exists(const char *name);
+
+#ifdef WC_SAVEFS_IMPLEMENTATION
 
 /* ── internals ─────────────────────────────────────────────────────────── */
 
@@ -102,7 +142,7 @@ static void wc_savefs_reindex(void)
 
 /* Parse the region. A blob the host has never written is all zeroes, so the
  * magic check doubles as "first run". */
-static void wc_savefs_init(void *region, uint32_t bytes)
+void wc_savefs_init(void *region, uint32_t bytes)
 {
 	memset(&wc_savefs, 0, sizeof wc_savefs);
 	wc_savefs.blob = (uint8_t *)region;
@@ -201,7 +241,7 @@ static void wc_savefs_commit(wc_savefs_writer_t *w, size_t written)
  * A write handle must be closed with wc_savefs_fclose(), not plain fclose(),
  * so the data reaches the region.
  */
-static FILE *wc_savefs_fopen(const char *name, const char *mode)
+FILE *wc_savefs_fopen(const char *name, const char *mode)
 {
 	const int writing = (strchr(mode, 'w') != NULL) ||
 	                    (strchr(mode, 'a') != NULL) ||
@@ -240,7 +280,7 @@ static FILE *wc_savefs_fopen(const char *name, const char *mode)
  * handle this layer did not open -- it falls through to fclose(), so a port can
  * route every fclose() here without tracking which is which.
  */
-static int wc_savefs_fclose(FILE *fp)
+int wc_savefs_fclose(FILE *fp)
 {
 	if (fp == NULL)
 		return EOF;
@@ -265,9 +305,11 @@ static int wc_savefs_fclose(FILE *fp)
 }
 
 /* Does a save file exist? For ports that probe before reading. */
-static int wc_savefs_exists(const char *name)
+int wc_savefs_exists(const char *name)
 {
 	return wc_savefs_find(name) >= 0;
 }
+
+#endif /* WC_SAVEFS_IMPLEMENTATION */
 
 #endif /* WC_SDL_SAVEFS_H */
