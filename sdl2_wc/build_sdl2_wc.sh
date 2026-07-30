@@ -20,18 +20,31 @@ fi
 EMSDK_ROOT="$(cd "$EMSDK" && pwd)"
 source "$EMSDK_ROOT/emsdk_env.sh" 2>/dev/null || true
 
-# SDL2 source (from Emscripten's port cache)
-SDL2_SRC="$EMSDK_ROOT/upstream/emscripten/cache/ports/sdl2/SDL-release-2.32.8"
+# SDL2 source, from Emscripten's port cache.
+#
+# GLOBBED, not hardcoded: each emsdk release vendors a different SDL. Pinning a
+# version here means anyone on a different emsdk gets "SDL2 source not found",
+# which reads like a broken cache rather than a version mismatch. (It did exactly
+# that: this script wanted SDL-release-2.32.8 while emsdk 4.0.3 ships 2.30.9.)
+SDL2_PORTS="$EMSDK_ROOT/upstream/emscripten/cache/ports/sdl2"
+SDL2_SRC="$(ls -d "$SDL2_PORTS"/SDL-release-*/ 2>/dev/null | head -1)"
+SDL2_SRC="${SDL2_SRC%/}"
 
-if [ ! -d "$SDL2_SRC" ]; then
-    echo "SDL2 source not found. Triggering Emscripten port download..."
-    echo '#include <SDL.h>' > /tmp/_sdl2_trigger.c
-    emcc -sUSE_SDL=2 -c /tmp/_sdl2_trigger.c -o /dev/null 2>/dev/null || true
-    rm -f /tmp/_sdl2_trigger.c
-    if [ ! -d "$SDL2_SRC" ]; then
-        echo "ERROR: SDL2 source still not found at $SDL2_SRC"
-        exit 1
-    fi
+if [ -z "$SDL2_SRC" ]; then
+    echo "SDL2 source not found. Populating Emscripten's port cache..."
+    # embuilder is emscripten's own command for this and reports its errors,
+    # unlike a throwaway compile with stderr redirected away.
+    embuilder build sdl2 || true
+    SDL2_SRC="$(ls -d "$SDL2_PORTS"/SDL-release-*/ 2>/dev/null | head -1)"
+    SDL2_SRC="${SDL2_SRC%/}"
+fi
+
+if [ -z "$SDL2_SRC" ]; then
+    echo "ERROR: no SDL-release-* directory under $SDL2_PORTS" >&2
+    echo "       Contents:" >&2
+    ls -A "$SDL2_PORTS" 2>/dev/null | sed 's/^/         /' >&2 || echo "         (missing)" >&2
+    echo "       Try: embuilder build sdl2" >&2
+    exit 1
 fi
 
 echo "SDL2 source: $SDL2_SRC"

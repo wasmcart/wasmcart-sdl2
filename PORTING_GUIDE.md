@@ -381,6 +381,69 @@ retroemu path/to/my-game/
 #     levels/...
 ```
 
+## Saving (the save region)
+
+The asset API above is **read-only**: `wc_load_asset()` gets a cart's shipped
+files, and there is nowhere for `fopen(..., "wb")` to go. Most ported games write
+*something* — a config file, high scores, progress — so without handling this the
+port silently loses saves and the player never finds out until they relaunch.
+
+wasmcart's answer is the **save region**. The cart declares a plain byte blob;
+the host loads it before `wc_init()` and persists it afterwards, wherever it
+likes (a file, browser storage, libretro SRAM). The cart never learns where. See
+[SPEC.md](https://github.com/wasmcart/wasmcart/blob/main/SPEC.md), *Saving is
+host-managed*.
+
+```c
+static uint8_t save_blob[WC_SAVEFS_BYTES];
+
+wc_info_t *wc_get_info(void) {
+    ...
+    info.save_ptr  = (uint32_t)(uintptr_t)save_blob;
+    info.save_size = sizeof(save_blob);
+    return &info;
+}
+```
+
+That gives you bytes. A game wants *files*, so
+[`include/wc_sdl_savefs.h`](include/wc_sdl_savefs.h) turns the blob into a
+handful of named ones, letting a port keep its `fopen`/`fread`/`fwrite` calls:
+
+```c
+#include "wc_sdl_savefs.h"
+
+void wc_init(void) {
+    wc_savefs_init(save_blob, sizeof(save_blob));
+}
+
+/* in the game's fopen shim */
+FILE *game_fopen(const char *name, const char *mode) {
+    if (is_a_save_file(name))
+        return wc_savefs_fopen(name, mode);      /* config, progress */
+    return asset_fopen(name);                    /* shipped data, read-only */
+}
+```
+
+Close write handles with `wc_savefs_fclose()` rather than plain `fclose()` — that
+is what folds the buffer back into the region. It falls through to `fclose()` for
+handles it did not open, so a port can route every close through it without
+tracking which is which.
+
+`wc_savefs_exists()` covers games that probe before reading.
+
+**What it deliberately is not.** A fixed table of up to 8 files (override
+`WC_SAVEFS_MAX_FILES`), no directories, no free list. A game saving a config and
+a progress file does not need a filesystem, and a real one would be more code
+than the games it serves. Rewriting a file at a different size shifts the ones
+after it, which is handled — [`test/savefs_test.c`](test/savefs_test.c) covers
+that case specifically, along with the one that actually matters: copying the
+region out, zeroing it, restoring it and re-reading, which is what happens
+between two sessions.
+
+**Sizing.** `WC_SAVEFS_BYTES` defaults to the header plus 60KB. Hosts persist
+this region on every save, so keep it to what the game needs rather than
+declaring a megabyte.
+
 ## Detailed Porting Steps
 
 ### Step 1: Understand the Original Game

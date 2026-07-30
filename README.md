@@ -34,7 +34,11 @@ sdl2_wc/              wasmcart-native SDL2 backend (video + audio + GL blit)
   build_sdl2_wc.sh        builds libSDL2_wc.a with Emscripten
 include/
   wc_sdl_stubs.h          minimal SDL2 type shims for lighter ports
+  wc_sdl_savefs.h         named files over the wasmcart save region, so a port
+                          can keep its fopen/fwrite calls for config and progress
   stb_image.h / stb_truetype.h / stb_vorbis.c   3rd-party decoders (public domain / MIT)
+test/
+  savefs_test.c         round-trips the save layer through a simulated host reload
 audio_bridge.{c,h}    PCM bridge helpers
 emstubs.c             emscripten runtime stubs
 ```
