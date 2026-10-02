@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # Header-only layers (save files, SDL_net shim). Plain host compiler; they
+  # test the C logic, not the wasm build.
+  c-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: savefs (two translation units, like a real port)
+        run: |
+          gcc -Wall -I include -o savefs_test test/savefs_test.c test/savefs_second_tu.c
+          ./savefs_test
+      - name: SDL_net shim
+        run: |
+          gcc -Wall -I include -o net_test test/net_test.c
+          ./net_test
+
+  # The backend itself: build libSDL2_wc.a with Emscripten, link a cart against
+  # it, and run that cart in the reference wasmcart host from npm. This is the
+  # check that catches the backend drifting from the host's ABI.
+  sdl2-backend:
+    runs-on: ubuntu-latest
+    env:
+      # The SDL2 source comes from this emsdk's port cache, so the version here
+      # decides which SDL release the backend is built against.
+      EMSDK_VERSION: 4.0.18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # The reference host links a GL stack even for a 2D cart; Mesa's software
+      # rasterizer stands in for a GPU.
+      - name: Install headless GL (Mesa software rasterizer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgles2 libgl1-mesa-dri libglvnd0
+      - name: Cache emsdk
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}-sdl2
+      - name: Install emsdk
+        run: |
+          E="$RUNNER_TEMP/emsdk"
+          [ -d "$E" ] || git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$E"
+          "$E/emsdk" install "$EMSDK_VERSION"
+          "$E/emsdk" activate "$EMSDK_VERSION"
+          echo "EMSDK=$E" >> "$GITHUB_ENV"
+      - name: Build libSDL2_wc.a
+        run: ./sdl2_wc/build_sdl2_wc.sh
+      - name: Install the wasmcart host
+        working-directory: test/input_cart
+        run: npm ci
+      - name: Build the input test cart
+        run: ./test/input_cart/build.sh
+      - name: Pointer, touch and wheel reach SDL
+        run: node test/input_cart/input_test.mjs

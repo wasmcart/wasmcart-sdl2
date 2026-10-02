@@ -39,6 +39,10 @@ include/
   stb_image.h / stb_truetype.h / stb_vorbis.c   3rd-party decoders (public domain / MIT)
 test/
   savefs_test.c         round-trips the save layer through a simulated host reload
+  net_test.c            the SDL_net shim over wc_peer_*
+  input_cart/           an SDL2 cart run in the Node host: pointer, touch and
+                        wheel must arrive as the right SDL events
+.github/workflows/ci.yml  runs all three, and builds libSDL2_wc.a with emsdk
 audio_bridge.{c,h}    PCM bridge helpers
 emstubs.c             emscripten runtime stubs
 ```
@@ -52,6 +56,14 @@ there is nothing else to fetch.
 ```bash
 # builds libSDL2_wc.a (+ libSDL2_ttf_wc.a); point EMSDK at your emsdk checkout
 EMSDK=/path/to/emsdk ./sdl2_wc/build_sdl2_wc.sh
+```
+
+To check the backend against the real host (what CI runs):
+
+```bash
+cd test/input_cart && npm install && cd ../..
+EMSDK=/path/to/emsdk ./test/input_cart/build.sh
+node test/input_cart/input_test.mjs
 ```
 
 Compiled objects and static libs are **not** committed (see `.gitignore`) — build
@@ -99,6 +111,23 @@ Two traps this recipe steps around, both covered in
   ```
 
 ## Input and rumble
+
+Point the backend at the cart's input buffers in `wc_init()` (the same ones
+`wc_info_t` hands the host):
+
+```c
+SDL_WASMCART_SetPads(wc_pads);
+SDL_WASMCART_SetKeys(wc_keys);          // needs WC_FLAG_KEYBOARD
+SDL_WASMCART_SetPointers(wc_pointers);  // needs WC_FLAG_POINTER
+SDL_WASMCART_SetWheel(&wc_wheel);       // needs WC_FLAG_POINTER (ABI v3.1)
+```
+
+Mouse, touch and wheel then arrive as ordinary SDL events: pointer slot 0 is
+the mouse (motion plus left/right/middle buttons), slots 1-9 are SDL fingers
+(which SDL also turns into mouse events by default, so mouse-only games work on
+touchscreens), and the wheel is `SDL_MOUSEWHEEL` in notches with trackpad
+fractions kept in `preciseX`/`preciseY`. Details in
+[PORTING_GUIDE.md](PORTING_GUIDE.md#sdl2-input).
 
 Pad state reaches a game two ways, both live at once:
 

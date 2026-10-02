@@ -1,0 +1,7 @@
+{
+  "name": "sdl2-input-test",
+  "version": "0.0.0",
+  "entry": "cart.wasm",
+  "width": 320,
+  "height": 240
+}

@@ -599,7 +599,7 @@ int r_trigger  = pad->right_trigger;  // 0-255
 
 #### Pointer Input (ABI v3, opt-in)
 
-For games that need mouse/touch (RTS, drawing, editors), declare `"pointer": true` in the manifest and set `WC_FLAG_POINTER` in your info flags. The host writes unified pointer state to `wc_pointer_t[10]` every frame — mouse is pointer 0, touch fingers fill slots 1+.
+For games that need mouse/touch (RTS, drawing, editors), set `WC_FLAG_POINTER` in your info flags; the flag is the only gate, no manifest field is involved. The host writes unified pointer state to `wc_pointer_t[10]` every frame: slot 0 is the mouse, slots 1-9 are touch contacts. The same flag also enables the scroll wheel (ABI v3.1): a `wc_wheel_t {dx, dy}` delta in 1/120 notch, up positive, written before each `wc_render` and cleared after. `WC_FILL_INFO` wires both `wc_pointers` and `wc_wheel` for you.
 
 ```c
 // In wc_get_info():
@@ -617,7 +617,13 @@ WC_EXPORT_NAME("wc_ptr_on_down")
 void wc_ptr_on_down(uint32_t id, int16_t x, int16_t y, uint8_t button) {
     // button: 0=primary, 1=secondary, 2=middle
 }
+
+// Scroll wheel, once per frame (0 when nothing scrolled):
+float notches_y = wc_wheel.dy / 120.0f;   // up positive
 ```
+
+An SDL2 port does not read these by hand: pass them to the backend and they
+arrive as ordinary SDL events (see [SDL2 input](#sdl2-input) below).
 
 #### Keyboard Input (ABI v3, opt-in)
 
@@ -638,7 +644,7 @@ void wc_kb_on_down(uint8_t keycode, uint8_t modifiers) {
 }
 ```
 
-**Important:** When `"keyboard": true` is set, the host delivers raw key events to the cart instead of mapping keyboard to gamepad buttons. Gamepad input is still always available.
+**Important:** When `WC_FLAG_KEYBOARD` is set, the host delivers raw key events to the cart instead of mapping keyboard to gamepad buttons. Gamepad input is still always available.
 
 ### Step 5: Handle Assets
 
@@ -2352,6 +2358,36 @@ The cart calls `SDL_WASMCART_SetFramebuffer(fb, w, h)` in `wc_init()` before
 `SDL_Init`, then uses ordinary `SDL_CreateRenderer` / `SDL_RenderFillRect` /
 `SDL_RenderPresent` — the backend routes the result into the wasmcart
 framebuffer.
+
+#### SDL2 input
+
+Hand the backend the same buffers the cart gives the host, in `wc_init()`:
+
+```c
+#include "SDL_wasmcart_video.h"
+
+SDL_WASMCART_SetPads(wc_pads);          // pad buttons -> SDL keyboard events
+SDL_WASMCART_SetKeys(wc_keys);          // WC_FLAG_KEYBOARD -> SDL key events
+SDL_WASMCART_SetPointers(wc_pointers);  // WC_FLAG_POINTER -> mouse + fingers
+SDL_WASMCART_SetWheel(&wc_wheel);       // WC_FLAG_POINTER -> SDL_MOUSEWHEEL
+```
+
+- Pointer slot 0 becomes `SDL_MOUSEMOTION` / `SDL_MOUSEBUTTON*` (left,
+  right, middle). Only changes are sent, and a button still held when the
+  pointer goes inactive is released.
+- Slots 1-9 become `SDL_FINGERDOWN` / `MOTION` / `UP` on one touch device,
+  normalized to 0..1. SDL also synthesizes mouse events from them by default
+  (`SDL_HINT_TOUCH_MOUSE_EVENTS`), so a mouse-only game works on a phone and a
+  touch-aware one gets real multi-touch.
+- The wheel becomes `SDL_MOUSEWHEEL` in notches: `preciseY` keeps trackpad
+  fractions, and the integer `y` accumulates them for older code.
+- Coordinates are cart pixels, which is the SDL window size.
+- The backend consumes the wheel on read (zeroes the struct). SDL pumps many
+  times per frame, and without that one notch would scroll once per pump.
+
+The cart must still set `WC_FLAG_POINTER` / `WC_FLAG_KEYBOARD`, or the host
+writes nothing to those buffers. `test/input_cart/` is a minimal cart that
+wires all of this and checks every event against the Node host.
 
 Compare this to the hand-porting approach which requires weeks of:
 - Writing SDL/SFML compat headers

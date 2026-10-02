@@ -425,12 +425,173 @@ static void push_key(SDL_Scancode scancode, Uint8 state)
     SDL_SendKeyboardKey(state, scancode);
 }
 
-/* absolute pointer (wasmcart pointer ABI): the host positions the cursor at an
- * exact coord + clicks. Feeds SDL mouse motion/button events. */
+/*---------------------------------------------------------------------------*/
+/* Pointer + wheel (wasmcart pointer ABI v3 / wheel ABI v3.1)
+ *
+ * The cart points us at the same wc_pointer_t[10] and wc_wheel_t it hands the
+ * host through wc_info_t.pointer_ptr / wheel_ptr (and sets WC_FLAG_POINTER, or
+ * the host writes neither). The host writes both before each wc_render.
+ *
+ * Slot 0 is the mouse: it becomes SDL mouse motion + buttons. Slots 1-9 are
+ * touch contacts: they become SDL finger events on one touch device, which SDL
+ * also turns into mouse events by default (SDL_HINT_TOUCH_MOUSE_EVENTS), so a
+ * mouse-only game still works on a phone and a touch-aware one gets real
+ * multi-touch. Coordinates are cart pixels, which is the SDL window size.
+ */
+
+/* must match wasmcart.h */
+typedef struct {
+    int16_t  x;
+    int16_t  y;
+    uint8_t  buttons;  /* bit0 primary, bit1 secondary, bit2 middle */
+    uint8_t  active;
+    uint8_t  _pad[2];
+} wc_pointer_t;
+
+typedef struct {
+    int32_t dx;        /* 1/120 notch, right positive */
+    int32_t dy;        /* 1/120 notch, UP positive */
+} wc_wheel_t;
+
+#define WC_POINTER_SLOTS 10
+#define WC_WHEEL_NOTCH   120.0f
+#define WC_TOUCH_ID      ((SDL_TouchID)1)
+
+static wc_pointer_t *wc_pointers_ptr = NULL;
+static wc_wheel_t   *wc_wheel_ptr = NULL;
+static wc_pointer_t  prev_pointers[WC_POINTER_SLOTS];
+static int           wc_touch_added = 0;
+
+void SDL_WASMCART_SetPointers(void *pointers)
+{
+    wc_pointers_ptr = (wc_pointer_t *)pointers;
+    SDL_memset(prev_pointers, 0, sizeof(prev_pointers));
+}
+
+void SDL_WASMCART_SetWheel(void *wheel)
+{
+    wc_wheel_ptr = (wc_wheel_t *)wheel;
+}
+
+/* LEGACY: before SetPointers existed, a cart could define these four functions
+ * to feed slot 0 by hand. Still honoured when SetPointers was never called. */
 extern int wc_pointer_active(void) __attribute__((weak));
 extern int wc_pointer_x(void) __attribute__((weak));
 extern int wc_pointer_y(void) __attribute__((weak));
 extern int wc_pointer_buttons(void) __attribute__((weak));
+
+/* Read the mouse slot from whichever source the cart wired. */
+static int host_mouse(int *x, int *y, int *buttons)
+{
+    if (wc_pointers_ptr) {
+        if (!wc_pointers_ptr[0].active) return 0;
+        *x = wc_pointers_ptr[0].x;
+        *y = wc_pointers_ptr[0].y;
+        *buttons = wc_pointers_ptr[0].buttons;
+        return 1;
+    }
+    if (wc_pointer_active && wc_pointer_active()) {
+        *x = wc_pointer_x();
+        *y = wc_pointer_y();
+        *buttons = wc_pointer_buttons();
+        return 1;
+    }
+    return 0;
+}
+
+static int host_mouse_active(void)
+{
+    int x, y, b;
+    return host_mouse(&x, &y, &b);
+}
+
+static void send_mouse_buttons(int now, int prev)
+{
+    static const Uint8 sdl_btn[3] = { SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT, SDL_BUTTON_MIDDLE };
+    for (int i = 0; i < 3; i++) {
+        int bit = 1 << i;
+        if ((now & bit) && !(prev & bit)) SDL_SendMouseButton(_wc_window, 0, SDL_PRESSED, sdl_btn[i]);
+        if (!(now & bit) && (prev & bit)) SDL_SendMouseButton(_wc_window, 0, SDL_RELEASED, sdl_btn[i]);
+    }
+}
+
+/* Analog-cursor position (see SDL_WASMCART_UpdateAnalogCursor below).
+ * -1 = uninitialized (centered on first use). */
+static float wc_cursor_x = -1.0f;
+static float wc_cursor_y = -1.0f;
+
+/* Slot 0 → SDL mouse. Sends only what changed: the pump runs many times per
+ * rendered frame, and an unchanged position is not a motion. */
+static void pump_mouse(void)
+{
+    static int prev_active = 0, prev_x = -1, prev_y = -1, prev_btn = 0;
+    int x = 0, y = 0, btn = 0;
+    int active = host_mouse(&x, &y, &btn);
+
+    if (active) {
+        SDL_SetMouseFocus(_wc_window);
+        if (!prev_active || x != prev_x || y != prev_y) {
+            SDL_SendMouseMotion(_wc_window, 0, 0, x, y);
+            wc_cursor_x = x; wc_cursor_y = y;   /* keep the gamepad cursor in sync */
+        }
+        send_mouse_buttons(btn, prev_btn);
+        prev_x = x; prev_y = y; prev_btn = btn;
+    } else if (prev_active) {
+        send_mouse_buttons(0, prev_btn);   /* never leave a button stuck down */
+        prev_btn = 0;
+    }
+    prev_active = active;
+}
+
+/* Slots 1-9 → SDL fingers, normalized to 0..1 as SDL expects. */
+static void pump_touch(void)
+{
+    if (!wc_pointers_ptr || !_wc_window) return;
+    float w = wc_window_w > 1 ? (float)(wc_window_w - 1) : 1.0f;
+    float h = wc_window_h > 1 ? (float)(wc_window_h - 1) : 1.0f;
+
+    for (int i = 1; i < WC_POINTER_SLOTS; i++) {
+        wc_pointer_t cur = wc_pointers_ptr[i];
+        wc_pointer_t *prev = &prev_pointers[i];
+        if (!cur.active && !prev->active) continue;
+
+        if (!wc_touch_added) {
+            SDL_AddTouch(WC_TOUCH_ID, SDL_TOUCH_DEVICE_DIRECT, "wasmcart");
+            wc_touch_added = 1;
+        }
+        float fx = cur.x / w, fy = cur.y / h;
+        if (cur.active && !prev->active) {
+            SDL_SendTouch(WC_TOUCH_ID, (SDL_FingerID)i, _wc_window, SDL_TRUE, fx, fy, 1.0f);
+        } else if (cur.active) {
+            if (cur.x != prev->x || cur.y != prev->y)
+                SDL_SendTouchMotion(WC_TOUCH_ID, (SDL_FingerID)i, _wc_window, fx, fy, 1.0f);
+        } else {
+            /* lifted: the host leaves the last position, but SDL wants one */
+            SDL_SendTouch(WC_TOUCH_ID, (SDL_FingerID)i, _wc_window, SDL_FALSE,
+                          prev->x / w, prev->y / h, 0.0f);
+        }
+        *prev = cur;
+    }
+}
+
+/* Wheel → SDL_MOUSEWHEEL, in notches (fractional for trackpads; SDL keeps the
+ * integer y/x for old code and preciseX/Y for new).
+ *
+ * CONSUMED ON READ: the host writes the frame's total before wc_render and
+ * zeroes it after, but the pump runs many times inside one frame, so without
+ * zeroing it here one notch would scroll once per pump. The host overwrites the
+ * field (it does not add to it), so clearing it cannot lose a later frame. */
+static void pump_wheel(void)
+{
+    if (!wc_wheel_ptr) return;
+    int32_t dx = wc_wheel_ptr->dx, dy = wc_wheel_ptr->dy;
+    if (!dx && !dy) return;
+    wc_wheel_ptr->dx = 0;
+    wc_wheel_ptr->dy = 0;
+    SDL_SetMouseFocus(_wc_window);
+    SDL_SendMouseWheel(_wc_window, 0, dx / WC_WHEEL_NOTCH, dy / WC_WHEEL_NOTCH,
+                       SDL_MOUSEWHEEL_NORMAL);
+}
 
 /*---------------------------------------------------------------------------*/
 /* Analog-cursor gamepad control (generic — works for any pointer-driven cart).
@@ -457,8 +618,6 @@ extern int wc_pointer_buttons(void) __attribute__((weak));
 #define WC_CURSOR_SPEED_MOD   130000.0   /* larger = slower */
 #define WC_CURSOR_AXIS_POW    1.03       /* accel curve exponent */
 
-static float wc_cursor_x = -1.0f;   /* -1 = uninitialized (center on first use) */
-static float wc_cursor_y = -1.0f;
 
 /* Called once per rendered frame by the cart (e.g. Stratagus WaitEventsOneFrame).
  * Integrates left-stick deflection into the software cursor and feeds SDL a
@@ -467,7 +626,7 @@ void SDL_WASMCART_UpdateAnalogCursor(void)
 {
     if (!wc_pads_ptr || !wc_pads_ptr[0].connected) return;
     /* If the host is driving an absolute pointer this frame, it owns the cursor. */
-    if (wc_pointer_active && wc_pointer_active()) return;
+    if (host_mouse_active()) return;
 
     if (wc_cursor_x < 0.0f) { wc_cursor_x = wc_window_w * 0.5f; wc_cursor_y = wc_window_h * 0.5f; }
 
@@ -498,20 +657,10 @@ void SDL_WASMCART_UpdateAnalogCursor(void)
 
 static void WASMCART_PumpEvents(_THIS)
 {
-    /* Absolute pointer (host-driven mouse/touch) takes priority when active —
-     * lets the romdev pointer op / a real touchscreen drive the cursor exactly. */
-    if (wc_pointer_active && wc_pointer_active()) {
-        static int prev_pbtn = 0;
-        int px = wc_pointer_x(), py = wc_pointer_y();
-        wc_cursor_x = px; wc_cursor_y = py;   /* keep the gamepad cursor in sync */
-        SDL_SetMouseFocus(_wc_window); SDL_SendMouseMotion(_wc_window, 0, 0, px, py);
-        int pb = wc_pointer_buttons();
-        if ((pb & 1) && !(prev_pbtn & 1)) SDL_SendMouseButton(_wc_window, 0, SDL_PRESSED, SDL_BUTTON_LEFT);
-        if (!(pb & 1) && (prev_pbtn & 1)) SDL_SendMouseButton(_wc_window, 0, SDL_RELEASED, SDL_BUTTON_LEFT);
-        if ((pb & 2) && !(prev_pbtn & 2)) SDL_SendMouseButton(_wc_window, 0, SDL_PRESSED, SDL_BUTTON_RIGHT);
-        if (!(pb & 2) && (prev_pbtn & 2)) SDL_SendMouseButton(_wc_window, 0, SDL_RELEASED, SDL_BUTTON_RIGHT);
-        prev_pbtn = pb;
-    }
+    /* Host mouse, touch and wheel first: they need no gamepad. */
+    pump_mouse();
+    pump_touch();
+    pump_wheel();
 
     if (!wc_pads_ptr) return;
 

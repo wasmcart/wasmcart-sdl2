@@ -1,0 +1,9 @@
+{
+  "name": "wasmcart-sdl2-input-test",
+  "private": true,
+  "type": "module",
+  "description": "Drives input_cart through the reference wasmcart Node host",
+  "devDependencies": {
+    "wasmcart": "^0.25.1"
+  }
+}
