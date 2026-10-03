@@ -34,17 +34,22 @@
 /*---------------------------------------------------------------------------*/
 /* wasmcart pad types - must match wasmcart.h */
 
+/* 20 bytes as of ABI v4. Every analog axis is Sint16: sticks -32768..32767
+ * and triggers 0..32767, which is what SDL_GameControllerGetAxis itself
+ * reports, so a ported game sees its own native range on the way back out. */
 typedef struct {
-    Uint16 buttons;
+    Uint32 buttons;          /* bits 21-31 reserved */
     Sint16 left_x;
     Sint16 left_y;
     Sint16 right_x;
     Sint16 right_y;
-    Uint8  left_trigger;
-    Uint8  right_trigger;
+    Sint16 left_trigger;     /* 0..32767, never negative */
+    Sint16 right_trigger;    /* 0..32767, never negative */
     Uint8  connected;
     Uint8  _pad[3];
 } wc_pad_t;
+
+SDL_COMPILE_TIME_ASSERT(wc_pad_t_size, sizeof(wc_pad_t) == 20);
 
 #define WC_MAX_PADS 4
 
@@ -61,6 +66,12 @@ typedef struct {
 #define WC_BTN_DOWN   (1 << 9)
 #define WC_BTN_LEFT   (1 << 10)
 #define WC_BTN_RIGHT  (1 << 11)
+/* ABI v4 widened `buttons` to 32 bits and added L3/R3 (12-13), GUIDE (14),
+ * MISC1 (15), PADDLE1-4 (16-19) and TOUCHPAD (20). None are surfaced here
+ * yet: this joystick exposes eight buttons plus a hat, and adding more means
+ * growing WC_NUM_BUTTONS and the gamepad mapping in step, which is a change
+ * to what every ported game sees rather than an ABI fix. A cart that wants
+ * them reads the pad struct. Left deliberately, not overlooked. */
 
 /*---------------------------------------------------------------------------*/
 /* Host imports.
@@ -368,7 +379,7 @@ static void WASMCART_JoystickUpdate(SDL_Joystick *joystick)
 {
     int pad;
     const wc_pad_t *p;
-    Uint16 buttons;
+    Uint32 buttons;
     Uint8 hat = SDL_HAT_CENTERED;
 
     if (!wc_pads_ptr) {
@@ -385,12 +396,19 @@ static void WASMCART_JoystickUpdate(SDL_Joystick *joystick)
     SDL_PrivateJoystickAxis(joystick, 1, p->left_y);
     SDL_PrivateJoystickAxis(joystick, 2, p->right_x);
     SDL_PrivateJoystickAxis(joystick, 3, p->right_y);
-    /* Triggers are 0..255 unsigned on the wasmcart side and -32768..32767 on
-     * SDL's, where a released trigger reads as the minimum rather than zero. */
+    /* Triggers are 0..32767 unsigned on the wasmcart side (ABI v4) and
+     * -32768..32767 on the JOYSTICK layer, where a released trigger reads as
+     * the minimum rather than zero -- that is a different convention from
+     * SDL_GameControllerGetAxis, which reports 0..32767. The mapping supplied
+     * by WASMCART_JoystickGetGamepadMapping turns this back into the
+     * gamecontroller range, so a ported game sees whichever it asks for.
+     *
+     * This was `* 257 - 32768` while the wire value was a byte; the multiply
+     * is gone now that both sides are 15-bit. */
     SDL_PrivateJoystickAxis(joystick, 4,
-        (Sint16)(((int)p->left_trigger * 257) - 32768));
+        (Sint16)(((int)p->left_trigger * 2) - 32768));
     SDL_PrivateJoystickAxis(joystick, 5,
-        (Sint16)(((int)p->right_trigger * 257) - 32768));
+        (Sint16)(((int)p->right_trigger * 2) - 32768));
 
     SDL_PrivateJoystickButton(joystick, 0, (buttons & WC_BTN_A) ? SDL_PRESSED : SDL_RELEASED);
     SDL_PrivateJoystickButton(joystick, 1, (buttons & WC_BTN_B) ? SDL_PRESSED : SDL_RELEASED);

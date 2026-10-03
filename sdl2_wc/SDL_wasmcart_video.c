@@ -23,17 +23,23 @@
 /*---------------------------------------------------------------------------*/
 /* wasmcart pad types — must match wasmcart.h */
 
+/* 20 bytes as of ABI v4; see the note in SDL_wasmcart_joystick.c. This is a
+ * SECOND copy of the struct in this library, which is why both went stale
+ * together when the ABI moved: the assert below makes a mismatch a build
+ * failure rather than a misread field. */
 typedef struct {
-    uint16_t buttons;
+    uint32_t buttons;        /* bits 21-31 reserved */
     int16_t  left_x;
     int16_t  left_y;
     int16_t  right_x;
     int16_t  right_y;
-    uint8_t  left_trigger;
-    uint8_t  right_trigger;
+    int16_t  left_trigger;   /* 0..32767, never negative */
+    int16_t  right_trigger;  /* 0..32767, never negative */
     uint8_t  connected;
     uint8_t  _pad[3];
 } wc_pad_t;
+
+SDL_COMPILE_TIME_ASSERT(wc_pad_t_size_video, sizeof(wc_pad_t) == 20);
 
 /* Button bit masks — must match wasmcart.h */
 #define WC_BTN_A      (1 << 0)
@@ -664,7 +670,7 @@ static void WASMCART_PumpEvents(_THIS)
 
     if (!wc_pads_ptr) return;
 
-    uint16_t buttons = wc_pads_ptr[0].buttons;
+    uint32_t buttons = wc_pads_ptr[0].buttons;
     uint16_t pressed  = buttons & ~prev_buttons;
     uint16_t released = ~buttons & prev_buttons;
 
